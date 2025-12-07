@@ -1,0 +1,252 @@
+import time
+import csv
+import random
+import threading
+from gpiozero import DigitalOutputDevice
+from datetime import datetime
+
+
+# Constants
+VREF = 3.3
+PU_SCALE = 1.3 / VREF
+IN = 300.0
+VN = 30000.0
+INSTANT_PICKUP = 1.2
+DELAY_PICKUP = 1.1
+DELAY_TIME = 2.0
+
+ANSI_50_TRIP_V = (INSTANT_PICKUP * VREF) / 1.3
+ANSI_51_TRIP_V = (DELAY_PICKUP * VREF) / 1.3
+
+# === PHASE CONFIGURATION (currents only) ===
+I_PHASES = ['IA', 'IB', 'IC']
+U_PHASES = ['UA', 'UB', 'UC']
+
+# === FIXED VOLTAGES ===
+FIXED_VOLTAGE_PU = {'Va': 1.0, 'Vb': 1.0, 'Vc': 1.0}
+
+# === TRIP OUTPUT ===
+TRIP_OUTPUT = DigitalOutputDevice(17)
+
+trip_timers_50 = {phase: None for phase in I_PHASES}
+trip_timers_51 = {phase: None for phase in I_PHASES}
+pickup_start_times_50 = {phase: None for phase in I_PHASES}
+pickup_start_times_51 = {phase: None for phase in I_PHASES}
+post_trip_50_block = {phase: False for phase in I_PHASES}
+post_trip_51_block = {phase: False for phase in I_PHASES}
+
+file_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+log_filename = "fault_log"+file_timestamp+".csv"
+
+# Initialize CSV file with headers including pickup/trip/operation times
+# with open(log_filename, 'a', newline='') as f: se quiser dar append de eventos tenho que colocar sempre o mesmo nome de ficheiro,remover data, 
+with open(log_filename, 'w', newline='') as fault_log:
+    writer = csv.writer(fault_log)
+    writer.writerow([
+        "Phase", "Event Type", "Current (A)",
+        "Pickup Time", "Trip Time", "Operation Time (ms)"
+    ])
+
+
+def log_trip(phase, event_type, current_amps, pickup_time=None, trip_time=None):
+    if trip_time:
+        trip_str = datetime.fromtimestamp(trip_time).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    else:
+        trip_str = ""
+
+    if pickup_time:
+        pickup_str = datetime.fromtimestamp(pickup_time).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    else:
+        pickup_str = ""
+        operation_ms = ""
+
+    if pickup_time and trip_time:
+        operation_ms = float((trip_time - pickup_time)* 1000)
+        operation_ms_str = f"{operation_ms:.3f}"
+    else:
+        operation_ms_str = ""
+
+    with open(log_filename, 'a', newline='') as fault_log:
+        writer = csv.writer(fault_log)
+        writer.writerow([
+            phase, event_type, f"{current_amps:.2f}",
+            pickup_str, trip_str, operation_ms_str
+        ])
+
+def delete_last_pickup_for_phase(phase):
+    with open(log_filename, 'r', newline='') as fault_log:
+        rows = list(csv.reader(fault_log))
+
+    # Remove o ultimo Pickup "ANSI 51 Pickup" para a fase correspondente
+    for i in range(len(rows) - 1, 0, -1):
+        if len(rows[i]) > 1 and rows[i][0] == phase and "Pickup" in rows[i][1]:
+            rows.pop(i)
+            break 
+
+    with open(log_filename, 'w', newline='') as fault_log:
+        writer = csv.writer(fault_log)
+        writer.writerows(rows)
+
+#---------------------------------------------------------------------------------------------------------------------------------
+
+# def simulate_real_time_current_voltages (t): # ANSI 51 PICKUP THEN ANSI 51 RESET AND THEN ANSI 51 TRIP
+#     if t < 1.0:
+#         pu_min, pu_max = 0.0, 0.0
+#     elif t < 2.0:
+#         pu_min, pu_max = 1.0, 1.09
+#     elif t < 3.0: 
+#         pu_min, pu_max = 1.1, 1.19
+#     elif t < 4.0:
+#         pu_min, pu_max = 1.0, 1.09
+#     elif t < 6.5: 
+#         pu_min, pu_max = 1.1, 1.19
+#     elif t < 8: 
+#         return 0.0
+#     else:
+#         return 0.0 
+#     return ((random.uniform(pu_min, pu_max) * VREF) / 1.3)
+
+def simulate_real_time_current_voltages (t): # ANSI 51 PICKUP THEN ANSI 50 PICKUP AND IMMEDIATE TRIP IN THE NEXT SECOND
+    if t < 1.0:
+        pu_min, pu_max = 0.0, 0.0
+    elif t < 2.0:
+        pu_min, pu_max = 1.0, 1.09
+    elif t < 3.0: 
+        pu_min, pu_max = 1.1, 1.19
+    elif t < 4.0:
+        pu_min, pu_max = 1.2, 1.3
+    elif t < 4.5: 
+        return 0.0
+    else:
+        return 0.0 
+    return ((random.uniform(pu_min, pu_max) * VREF) / 1.3)
+
+
+# def simulate_real_time_current_voltages (t): # ANSI 50 TRIP
+#     if t < 1.0:
+#         pu_min, pu_max = 0.0, 0.0
+#     elif t < 2.0:
+#         pu_min, pu_max = 1.0, 1.09
+#     elif t < 3.0: 
+#         pu_min, pu_max = 1.2, 1.3
+#     elif t < 4.0: 
+#         return 0.0
+#     else:
+#         return 0.0 
+#     return ((random.uniform(pu_min, pu_max) * VREF) / 1.3)
+
+
+#---------------------------------------------------------------------------------------------------------------------------------
+
+def trip_handler():
+    TRIP_OUTPUT.on()
+    print("Trip activated")
+    time.sleep(2) 
+    TRIP_OUTPUT.off()
+    print("Trip cleared after 2 seconds")
+    trip_active = False
+
+def convert_raw_adc(raw_adc):
+    return ((raw_adc/1023) * VREF)
+
+def convert_voltages_real_amps(i_voltage_gpio):
+    return (i_voltage_gpio*PU_SCALE*IN)
+
+def convert_voltages_real_volts(v_voltage_gpio):
+    return (v_voltage_gpio*PU_SCALE*VN)
+
+
+start_time = time.time()
+
+try:
+    print("Simulating...")
+    while True:
+        now = time.time()
+        elapsed = now - start_time
+        trip_active = False
+
+        # Ia = convert_raw_adc(spi.ch(0))
+        # Ib = convert_raw_adc(spi.ch(1))
+        # Ic = convert_raw_adc(spi.ch(2))
+        # Va = convert_raw_adc(spi.ch(3))
+        # Vb = convert_raw_adc(spi.ch(4))
+        # Vc = convert_raw_adc(spi.ch(5))
+
+        Ia = simulate_real_time_current_voltages (elapsed)
+        Ib = simulate_real_time_current_voltages (elapsed)
+        Ic = simulate_real_time_current_voltages (elapsed)
+        Va = simulate_real_time_current_voltages (elapsed)
+        Vb = simulate_real_time_current_voltages (elapsed)
+        Vc = simulate_real_time_current_voltages (elapsed)
+
+        Currents_array=[Ia,Ib,Ic]
+        Voltages_array=[Va,Vb,Vc]
+       
+        
+        for i in range (len(Currents_array)):
+            phase=I_PHASES[i]
+            # Time-delayed trip (ANSI 51)
+            if Currents_array[i] >= ANSI_51_TRIP_V and not post_trip_51_block[phase]:
+                if pickup_start_times_51[phase] is None:
+                    pickup_start_times_51[phase] = time.time()
+                    print(f"ANSI 51: Pickup on {phase}")
+                    trip_timers_51[phase] = None
+                    print(f"Pickup started on phase {phase} at {datetime.fromtimestamp(pickup_start_times_51[phase]).strftime('%H:%M:%S.%f')[:-3]}")
+                    log_trip(phase, "ANSI 51 Pickup", convert_voltages_real_amps(Currents_array[i]), pickup_start_times_51[phase],trip_timers_51[phase])
+                elif now - pickup_start_times_51[phase] >= DELAY_TIME:
+                    trip_active = True
+                    #TRIP_OUTPUT.on()
+                    trip_timers_51[phase] = time.time()
+                    print(f"ANSI 51: Trip on {phase}")
+                    delete_last_pickup_for_phase(phase)
+                    log_trip(phase, "ANSI 51 Trip", convert_voltages_real_amps(Currents_array[i]), pickup_start_times_51[phase],trip_timers_51[phase])
+                    # Reset timers after trip
+                    post_trip_51_block[phase] = True
+                    trip_timers_51[phase] = None
+                    pickup_start_times_51[phase] = None
+            else:
+               # Reset block **only when current drops below pickup AND block is active**
+                if Currents_array[i] < ANSI_51_TRIP_V and post_trip_51_block[phase]:
+                    post_trip_51_block[phase] = False
+                # Reset pickup timer if current drops below pickup (normal condition)
+                if Currents_array[i] < ANSI_51_TRIP_V:
+                 pickup_start_times_51[phase] = None
+                 trip_timers_51[phase] = None
+
+            # Instantaneous trip (ANSI 50) - immediate trip   
+            if Currents_array[i]  >= ANSI_50_TRIP_V and not post_trip_50_block[phase]:
+                pickup_start_times_50[phase] = time.time()
+                trip_active = True
+                #TRIP_OUTPUT.on()
+                trip_timers_50[phase] = time.time()
+                print(f"ANSI 50: Pickup on {phase}")
+                print(f"ANSI 50: Trip on {phase}")
+                log_trip(phase , "ANSI 50 Trip", convert_voltages_real_amps(Currents_array[i]), pickup_start_times_50[phase],trip_timers_50[phase])
+                post_trip_50_block[phase] = True
+            else:
+                # Reset block only when current drops below pickup AND block is active
+                if Currents_array[i] < ANSI_50_TRIP_V and post_trip_50_block[phase]:
+                    post_trip_50_block[phase] = False
+                # Always clear pickup timers when below threshold
+                if Currents_array[i] < ANSI_50_TRIP_V:
+                    pickup_start_times_50[phase] = None
+                    trip_timers_50[phase] = None
+
+        if trip_active:
+            threading.Thread(target=trip_handler).start()
+            trip_active = False
+        
+        for i in range (len(Currents_array)):
+            i_real = convert_voltages_real_amps(Currents_array[i])
+            print(f"{I_PHASES[i]} = {i_real:.2f} A")
+
+        for i in range (len(Voltages_array)):
+            u_real = convert_voltages_real_volts(Voltages_array[i])/1000
+            print(f"{U_PHASES[i]} = {u_real:.2f} kV")
+        print("-" * 50)
+
+        time.sleep(0.01)
+
+except KeyboardInterrupt:
+    print("Interrupted. Cleaning up...")
+    TRIP_OUTPUT.off()
