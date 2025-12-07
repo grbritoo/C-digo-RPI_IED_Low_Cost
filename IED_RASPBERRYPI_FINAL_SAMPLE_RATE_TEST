@@ -1,0 +1,321 @@
+import time
+import csv
+import random
+import threading
+import spidev
+from gpiozero import DigitalOutputDevice
+from datetime import datetime
+
+
+# Constants
+VREF = 3.3
+MAX_SCALE= 2.1
+
+IN = 192.69             #Valor editavel conforme Sistema Elétrico
+VN = 30000.0            #Valor editavel conforme Sistema Elétrico
+INSTANT_PICKUP = 2.0
+DELAY_PICKUP = 1.3
+DELAY_TIME = 2.0
+
+PU_SCALE_I = MAX_SCALE / VREF
+PU_SCALE_U = 1.3 / VREF
+
+ANSI_50_TRIP_V = (INSTANT_PICKUP * VREF) / MAX_SCALE
+ANSI_51_TRIP_V = (DELAY_PICKUP * VREF) / MAX_SCALE
+ANSI_51_TRIP_RESET = ANSI_51_TRIP_V * 0.95
+ANSI_50_TRIP_RESET = ANSI_50_TRIP_V * 0.95
+
+CH_AVAILABLE = 6
+
+# === PHASE CONFIGURATION (currents only) ===
+I_PHASES = ['IA', 'IB', 'IC']
+U_PHASES = ['UA', 'UB', 'UC']
+
+# === FIXED VOLTAGES ===
+FIXED_VOLTAGE_PU = {'Va': 1.0, 'Vb': 1.0, 'Vc': 1.0}
+
+# === TRIP OUTPUT ===
+TRIP_OUTPUT = DigitalOutputDevice(17)
+
+trip_timers_50 = {phase: None for phase in I_PHASES}
+trip_timers_51 = {phase: None for phase in I_PHASES}
+pickup_start_times_50 = {phase: None for phase in I_PHASES}
+pickup_start_times_51 = {phase: None for phase in I_PHASES}
+post_trip_50_block = {phase: False for phase in I_PHASES}
+post_trip_51_block = {phase: False for phase in I_PHASES}
+
+file_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+log_filename = "fault_log"+file_timestamp+".csv"
+
+# Initialize CSV file with headers including pickup/trip/operation times
+# with open(log_filename, 'a', newline='') as f: se quiser dar append de eventos tenho que colocar sempre o mesmo nome de ficheiro,remover data, 
+with open(log_filename, 'w', newline='') as fault_log:
+    writer = csv.writer(fault_log)
+    writer.writerow([
+        "Phase", "Event Type", "Current (A)",
+        "Pickup Time", "Trip Time", "Operation Time (ms)"
+    ])
+
+
+def log_trip(phase, event_type, current_amps, pickup_time=None, trip_time=None):
+    if trip_time:
+        trip_str = datetime.fromtimestamp(trip_time).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    else:
+        trip_str = ""
+
+    if pickup_time:
+        pickup_str = datetime.fromtimestamp(pickup_time).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    else:
+        pickup_str = ""
+        operation_ms = ""
+
+    if pickup_time and trip_time:
+        operation_ms = float((trip_time - pickup_time)* 1000)
+        operation_ms_str = f"{operation_ms:.3f}"
+    else:
+        operation_ms_str = ""
+
+    with open(log_filename, 'a', newline='') as fault_log:
+        writer = csv.writer(fault_log)
+        writer.writerow([
+            phase, event_type, f"{current_amps:.2f}",
+            pickup_str, trip_str, operation_ms_str
+        ])
+
+def delete_last_pickup_for_phase(phase):
+    with open(log_filename, 'r', newline='') as fault_log:
+        rows = list(csv.reader(fault_log))
+
+    # Remove o ultimo Pickup "ANSI 51 Pickup" para a(s) fase(s) correspondente(s)
+    for i in range(len(rows) - 1, 0, -1):
+        if len(rows[i]) > 1 and rows[i][0] == phase and "Pickup" in rows[i][1]:
+            rows.pop(i)
+            break 
+
+    with open(log_filename, 'w', newline='') as fault_log:
+        writer = csv.writer(fault_log)
+        writer.writerows(rows)
+
+#---------------------------------------------------------------------------------------------------------------------------------
+
+# def simulate_real_time_current_voltages (t): # ANSI 51 PICKUP THEN ANSI 51 RESET AND THEN ANSI 51 TRIP
+#     if t < 1.0:
+#         pu_min, pu_max = 0.0, 0.0
+#     elif t < 2.0:
+#         pu_min, pu_max = 1.0, 1.09
+#     elif t < 3.0: 
+#         pu_min, pu_max = 1.1, 1.19
+#     elif t < 4.0:
+#         pu_min, pu_max = 1.0, 1.09
+#     elif t < 6.5: 
+#         pu_min, pu_max = 1.1, 1.19
+#     elif t < 8: 
+#         return 0.0
+#     else:
+#         return 0.0 
+#     return ((random.uniform(pu_min, pu_max) * VREF) / 1.3)
+
+# def simulate_real_time_current_voltages (t): # ANSI 51 PICKUP THEN ANSI 50 PICKUP AND IMMEDIATE TRIP IN THE NEXT SECOND
+#     if t < 1.0:
+#         pu_min, pu_max = 0.0, 0.0
+#     elif t < 2.0:
+#         pu_min, pu_max = 1.0, 1.09
+#     elif t < 3.0: 
+#         pu_min, pu_max = 1.1, 1.19
+#     elif t < 4.0:
+#         pu_min, pu_max = 1.2, 1.3
+#     elif t < 4.5: 
+#         return 0.0
+#     else:
+#         return 0.0 
+#     return ((random.uniform(pu_min, pu_max) * VREF) / 1.3)
+
+
+# def simulate_real_time_current_voltages (t): # ANSI 50 TRIP
+#     if t < 1.0:
+#         pu_min, pu_max = 0.0, 0.0
+#     elif t < 2.0:
+#         pu_min, pu_max = 1.0, 1.09
+#     elif t < 3.0: 
+#         pu_min, pu_max = 1.2, 1.3
+#     elif t < 4.0: 
+#         return 0.0
+#     else:
+#         return 0.0 
+#     return ((random.uniform(pu_min, pu_max) * VREF) / 1.3)
+
+
+#---------------------------------------------------------------------------------------------------------------------------------
+
+def read_channel(ch):
+    # Send command to read channel 0
+    resp = spi.xfer2([1, (8 + ch) << 4, 0])
+    # Combine 10-bit value from response
+    value = ((resp[1] & 3) << 8) | resp[2]
+    return value
+
+
+
+def read_all_channels(ch_count):
+    results = []
+    for ch in range(ch_count):
+        # Each channel requires a separate 3-byte command
+        cmd = [1, (8 + ch) << 4, 0]
+        resp = spi.xfer2(cmd)
+        
+        # Extract 10-bit result
+        value = ((resp[1] & 0x03) << 8) | resp[2]
+        results.append(value)
+    #print(results)
+    return results
+
+def trip_handler():
+    TRIP_OUTPUT.on()
+    print("Trip activated")
+    time.sleep(2) 
+    TRIP_OUTPUT.off()
+    print("Trip cleared after 2 seconds")
+    #trip_active = False
+
+def convert_raw_adc(raw_adc_values):
+    results = []
+    for i in range(len(raw_adc_values)):
+        results.append((raw_adc_values[i]/1023) * VREF)
+    return results
+
+def convert_voltages_real_amps(i_voltage_gpio):
+    return (i_voltage_gpio*PU_SCALE_I*IN)
+
+def convert_voltages_real_volts(v_voltage_gpio):
+    return (v_voltage_gpio*PU_SCALE_U*VN)
+
+spi = spidev.SpiDev()
+spi.open(0, 0)          # Bus 0, CE0
+spi.max_speed_hz = 2340000  # 2.34 MHz Valor recomendado segundo datasheet MCP3008 para V >= 3.3V
+
+start_time = time.time()
+samples_count = 0
+sample_start_time = time.time()
+try:
+    print("Simulating...")
+    while True:
+        now = time.time()
+        elapsed = now - start_time
+        trip_active = False
+
+        # Ia_raw = read_channel(0)
+        # Ib_raw = read_channel(1)
+        # Ic_raw = read_channel(2)
+        # Va_raw = read_channel(3)
+        # Vb_raw = read_channel(4)
+        # Vc_raw = read_channel(5)
+
+        Ia_raw, Ib_raw, Ic_raw, Va_raw, Vb_raw, Vc_raw = read_all_channels(CH_AVAILABLE)
+
+        Currents_array_raw= [Ia_raw,Ib_raw,Ic_raw] # Se quiser imprimir estes valores descomentar e realizar printf = aos arrays abaixo
+        Voltages_array_raw= [Va_raw,Vb_raw,Vc_raw] # Se quiser imprimir estes valores descomentar e realizar printf = aos arrays abaixo
+        raw_values = Currents_array_raw +Voltages_array_raw
+        Ia, Ib, Ic, Va, Vb, Vc = convert_raw_adc(raw_values)
+        # Ib = convert_raw_adc(Ib_raw)
+        # Ic = convert_raw_adc(Ic_raw)
+        # Va = convert_raw_adc(Va_raw)
+        # Vb = convert_raw_adc(Vb_raw)
+        # Vc = convert_raw_adc(Vc_raw)
+
+        Currents_array=[Ia,Ib,Ic]
+        Voltages_array=[Va,Vb,Vc]
+
+        #Currents_Array, Voltage_Array = returnCalculatedValues()
+
+        # Ia = simulate_real_time_current_voltages (elapsed)
+        # Ib = simulate_real_time_current_voltages (elapsed)
+        # Ic = simulate_real_time_current_voltages (elapsed)
+        # Va = simulate_real_time_current_voltages (elapsed)
+        # Vb = simulate_real_time_current_voltages (elapsed)
+        # Vc = simulate_real_time_current_voltages (elapsed)
+       
+        for i in range (len(Currents_array)):
+            phase=I_PHASES[i]
+            # Time-delayed trip (ANSI 51)
+            if Currents_array[i] >= ANSI_51_TRIP_V and not post_trip_51_block[phase]:
+                if pickup_start_times_51[phase] is None:
+                    pickup_start_times_51[phase] = time.time()
+                    print(f"ANSI 51: Pickup on {phase}")
+                    trip_timers_51[phase] = None
+                    # print(f"Pickup started on phase {phase} at {datetime.fromtimestamp(pickup_start_times_51[phase]).strftime('%H:%M:%S.%f')[:-3]}")
+                    log_trip(phase, "ANSI 51 Pickup", convert_voltages_real_amps(Currents_array[i]), pickup_start_times_51[phase],trip_timers_51[phase])
+                elif now - pickup_start_times_51[phase] >= DELAY_TIME:
+                    trip_active = True
+                    #TRIP_OUTPUT.on()
+                    trip_timers_51[phase] = time.time()
+                    print(f"ANSI 51: Trip on {phase}")
+                    delete_last_pickup_for_phase(phase)
+                    log_trip(phase, "ANSI 51 Trip", convert_voltages_real_amps(Currents_array[i]), pickup_start_times_51[phase],trip_timers_51[phase])
+                    # Reset timers after trip
+                    post_trip_51_block[phase] = True
+                    trip_timers_51[phase] = None
+                    pickup_start_times_51[phase] = None
+            else:
+               # Reset block **only when current drops below pickup*0.95 AND block is active**
+                if Currents_array[i] < ANSI_51_TRIP_RESET and post_trip_51_block[phase]:
+                    post_trip_51_block[phase] = False
+                # Reset pickup timer if current drops below pickup*0.95 (normal condition)
+                if Currents_array[i] < ANSI_51_TRIP_RESET:
+                 pickup_start_times_51[phase] = None
+                 trip_timers_51[phase] = None
+
+            # Instantaneous trip (ANSI 50) - immediate trip   
+            if Currents_array[i]  >= ANSI_50_TRIP_V and not post_trip_50_block[phase]:
+                pickup_start_times_50[phase] = time.time()
+                trip_active = True
+                #TRIP_OUTPUT.on()
+                trip_timers_50[phase] = time.time()
+                print(f"ANSI 50: Pickup on {phase}")
+                print(f"ANSI 50: Trip on {phase}")
+                log_trip(phase , "ANSI 50 Trip", convert_voltages_real_amps(Currents_array[i]), pickup_start_times_50[phase],trip_timers_50[phase])
+                post_trip_50_block[phase] = True
+            else:
+                # Reset block only when current drops below pickup AND block is active
+                if Currents_array[i] < ANSI_50_TRIP_RESET and post_trip_50_block[phase]:
+                    post_trip_50_block[phase] = False
+                # Always clear pickup timers when below threshold
+                if Currents_array[i] < ANSI_50_TRIP_RESET:
+                    pickup_start_times_50[phase] = None
+                    trip_timers_50[phase] = None
+
+        if trip_active:
+            threading.Thread(target=trip_handler).start()
+            trip_active = False
+        
+        for i in range (len(Currents_array)):
+            i_real = convert_voltages_real_amps(Currents_array[i])
+            # print(f"{I_PHASES[i]} = {i_real:.2f} A")
+
+        for i in range (len(Voltages_array)):
+            u_real = convert_voltages_real_volts(Voltages_array[i])/1000
+        #     print(f"{U_PHASES[i]} = {u_real:.2f} kV")
+        # print("-" * 50)
+
+        #time.sleep(0.01)
+
+# Sample rate measurement
+        samples_count += 1
+        elapsed_sample_time = time.time() - sample_start_time
+        #print(f"Elapsed sample time: {elapsed_sample_time:.3f}s, sample_count: {sample_count}")
+        if elapsed_sample_time >= 1.0:
+            samples_per_channel_per_cycle = samples_count / 50
+            print(f"Samples per channel/sec: {samples_count:.1f}")
+            print(f"Samples per cycle (20 ms): {samples_per_channel_per_cycle:.1f}")
+            # if samples_per_channel_per_cycle >= 120:
+            #     print("Target achieved")
+            #     time.sleep(1)
+            # else:
+            #     print("Below target!")
+            #     time.sleep(1)
+            time.sleep(1)
+            samples_count = 0
+            sample_start_time = time.time()
+
+except KeyboardInterrupt:
+    print("Interrupted. Cleaning up...")
+    TRIP_OUTPUT.off()
